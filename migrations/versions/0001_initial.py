@@ -1,8 +1,9 @@
 """Initial CourtBook schema."""
+
 from alembic import op
 
+from app import models as _models  # noqa: F401
 from app.db import Base
-from app import models as _models
 
 revision = "0001_initial"
 down_revision = None

@@ -1,7 +1,7 @@
 """Payment boundary. Replace the mock provider with Stripe/Razorpay without changing routes."""
+
 from dataclasses import dataclass
 from decimal import Decimal
-from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -67,7 +67,9 @@ class PaymentCancellation:
         reason: str,
     ) -> PaymentCancellationRecord:
         existing = session.scalar(
-            select(PaymentCancellationRecord).where(PaymentCancellationRecord.idempotency_key == idempotency_key)
+            select(PaymentCancellationRecord).where(
+                PaymentCancellationRecord.idempotency_key == idempotency_key
+            )
         )
         if existing:
             return existing
