@@ -1,0 +1,37 @@
+services:
+  db:
+    image: postgres:15-alpine
+    network_mode: host
+    environment:
+      POSTGRES_DB: courtbook
+      POSTGRES_USER: courtbook
+      POSTGRES_PASSWORD: courtbook
+    volumes: ["postgres_data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U courtbook -d courtbook"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  api:
+    build:
+      context: .
+      network: host
+    network_mode: host
+    environment:
+      DATABASE_URL: postgresql+psycopg://courtbook:courtbook@127.0.0.1:5432/courtbook
+      REDIS_ENABLED: "false"
+      REDIS_URL: redis://127.0.0.1:6379/0
+      HOLD_TTL_SECONDS: 300
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+  redis:
+    image: redis:7-alpine
+    network_mode: host
+    profiles: ["cache"]
+    command: ["redis-server", "--appendonly", "yes", "--bind", "127.0.0.1"]
+    volumes: ["redis_data:/data"]
+volumes:
+  postgres_data:
+  redis_data:
