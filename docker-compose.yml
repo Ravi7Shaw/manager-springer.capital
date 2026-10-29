@@ -8,14 +8,17 @@ services:
       POSTGRES_PASSWORD: courtbook
     volumes: ["postgres_data:/var/lib/postgresql/data"]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U courtbook -d courtbook"]
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -h 127.0.0.1 -p 5432 -U courtbook -d courtbook",
+        ]
       interval: 5s
       timeout: 3s
       retries: 20
   api:
     build:
       context: .
-      network: host
     network_mode: host
     environment:
       DATABASE_URL: postgresql+psycopg://courtbook:courtbook@127.0.0.1:5432/courtbook
