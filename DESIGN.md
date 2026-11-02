@@ -1,186 +1,535 @@
-# CourtBook design
 
-This document describes CourtBook as it exists in the repository at commit `c079601` ("Fixed configuration"). It replaces the earlier DESIGN.md, which described several behaviors the code does not implement. Where code and earlier documentation disagree, this document follows the code and records the gap in section 12.
 
-Verification notes: items marked **reproduced** were run through the HTTP API against a local PostgreSQL 16 database with the pinned requirements.txt. Items marked **by reading** follow from the source and were not executed. On that same setup, `pytest -q` reports 4 passed, `ruff check`, `ruff format --check`, and `mypy app` all pass. That run used Python 3.12. CI uses PostgreSQL 15 and Python 3.14, so CI results may differ slightly.
+# CourtBook Design
 
-## 1. Purpose and scope
+> **Document status:** Architecture baseline and target design.
+>
+> This document distinguishes current implementation from planned behavior. A recommendation does not mean the corresponding code has already been implemented.
 
-CourtBook is a FastAPI service that lets members book time on courts at a venue. It supports placing a five-minute hold on a court interval, confirming the hold with a payment, cancelling with a refund rule, booking a weekly recurring series, checking availability, and producing a weekly utilization report for staff.
+## 1. Purpose and Scope
 
-It is a learning and engineering starter, not a production system. It has no authentication, the payment provider is a mock, and several correctness gaps are listed in section 12. Operational gaps (observability, backups, migrations, secrets) are tracked in LIMITATIONS.md.
+CourtBook is a FastAPI service for booking courts at a venue. It supports temporary court holds, confirmation, cancellation and refunds, weekly recurring bookings, availability checks, and staff utilization reporting.
+
+This is a learning and engineering starter, not a production system. Authentication is not implemented and the payment provider is a mock. Do not expose the service publicly or accept real money until the security, payment, correctness, and operational work described here is implemented and tested.
 
 ## 2. Architecture
 
-The code has four layers. The HTTP layer in `app/main.py` defines the routes and maps service errors to HTTP status codes. Request and response models live in `app/schemas.py`. The service layer in `app/services/bookings.py` holds the booking rules and transaction boundaries. The payment boundary in `app/services/payments.py` wraps a provider adapter; the only adapter, `PaymentProvider`, returns synthetic references and calls nothing external. The persistence layer is SQLAlchemy 2 models in `app/models/entities.py`, with one engine and session factory in `app/db.py`. PostgreSQL 15 is the system of record.
+### 2.1 Current Architecture
 
-Redis appears in the settings, the Compose file, and requirements.txt, but no code path imports or calls it. Nothing in the request path depends on it.
+The current application is a **modular monolith**:
 
-Most routes delegate to `BookingService`. The exception is `POST /recurring/weekly`, whose handler performs the member-limit check, court lookup, pricing, and row inserts itself. That split is the source of several defects in section 12.
+- HTTP routes and error mapping: `app/main.py`
+- Request and response schemas: `app/schemas.py`
+- Booking rules and transactions: `app/services/bookings.py`
+- Payment service and provider adapter: `app/services/payments.py`
+- SQLAlchemy models: `app/models/entities.py`
+- Database engine and session factory: `app/db.py`
+- PostgreSQL is the system of record.
+- Redis is configured but currently unused by request paths.
 
-The Dockerfile starts a single uvicorn process with default settings. Each request receives its own database session from `get_db`, and the session closes when the request ends.
+Most routes delegate to `BookingService`. The recurring-booking route currently contains its own business logic. This inconsistency is a source of defects and must be removed.
 
-## 3. Data model
+### 2.2 Target Architecture
 
-| Table | Key columns | Constraints and notes |
+Keep CourtBook as a **modular monolith** for the foreseeable future.
+
+The current domain does not justify splitting booking, payments, or venues into microservices. Premature service separation would introduce network failure modes, deployment overhead, and distributed consistency problems.
+
+Use explicit boundaries:
+
+| Module | Responsibility |
+|---|---|
+| API layer | HTTP parsing, authentication dependencies, status codes, response schemas |
+| Booking application service | Hold, confirm, cancel, recurring-booking use cases |
+| Booking domain policies | Reservation states, interval rules, member limits, pricing policies |
+| Payment application service | Payment/refund state machine and idempotency |
+| Payment provider adapter | Provider-specific API calls, signatures and references |
+| Persistence layer | SQLAlchemy sessions, repositories and database constraints |
+| Worker | Outbox delivery, payment reconciliation and optional expiry cleanup |
+| Operations | Logs, metrics, tracing, health checks, backups and migrations |
+
+Routes must remain thin. Every booking path, including recurring bookings, must use the same application-service boundary.
+
+Services must not depend on FastAPI request objects or HTTP status codes.
+
+Use dependency injection for service construction and a request-scoped SQLAlchemy session.
+
+Transaction ownership must be explicit. Application-service use cases own their units of work. Repositories must not commit independently.
+
+### 2.3 Target Request Flow
+
+For a booking mutation:
+
+1. Authenticate the caller.
+2. Derive the member ID from the verified identity.
+3. Validate the request and require timezone-aware timestamps.
+4. Invoke the relevant application service.
+5. Execute database changes in one transaction.
+6. Let PostgreSQL enforce concurrency-sensitive invariants.
+7. Persist external work as an outbox event in the same transaction.
+8. Commit and return the committed resource.
+
+A worker processes outbox events and calls external providers using stable provider idempotency keys.
+
+Webhooks must be signature-verified and processed idempotently. Unknown payment outcomes must be reconciled rather than guessed.
+
+## 3. Data Model
+
+### 3.1 Current Tables
+
+| Table | Purpose |
+|---|---|
+| `venues` | Venue name and timezone |
+| `courts` | Courts belonging to venues |
+| `reservations` | Court, member UUID, interval, status, hold expiry and price |
+| `payments` | Payment records |
+| `payment_cancellations` | Refund and cancellation records |
+
+There is currently no members table. `member_id` is supplied by the caller and is not a verified identity.
+
+The current schema also has no outbox, payment-attempt, recurring-series, or opening-hours model.
+
+### 3.2 Target Data Model Changes
+
+Introduce a `members` or identity-mapping table if CourtBook owns member profiles.
+
+Store the external identity-provider subject as a unique, immutable identifier. Reservations should reference the internal member ID using a foreign key.
+
+For booking-limit enforcement, lock the member row or a dedicated member-booking-account row.
+
+After acquiring the lock, count eligible reservations and create the booking within the same transaction.
+
+Add an `outbox_events` table with:
+
+- Event ID
+- Aggregate type and aggregate ID
+- Event type and schema version
+- Payload
+- Creation and availability timestamps
+- Attempt count
+- Last error
+- Lock/lease metadata
+- Processed timestamp
+
+Add indexes for ready-event polling.
+
+Keep secrets and unnecessary personal data out of event payloads.
+
+If recurring bookings are a first-class feature, introduce a recurring-series record linking generated reservations and recording the selected billing policy.
+
+## 4. Booking Rules and Concurrency
+
+### 4.1 Intervals and Database Authority
+
+Booking intervals are timezone-aware instants stored as PostgreSQL `timestamptz`.
+
+Reservation intervals are half-open:
+
+`[starts_at, ends_at)`
+
+Adjacent intervals such as 10:00–11:00 and 11:00–12:00 do not overlap.
+
+The GiST exclusion constraint on court equality and timestamp-range overlap is the authoritative protection against double booking.
+
+**Preserve this constraint.**
+
+Availability reads are advisory snapshots. A successful hold insert is the authoritative reservation attempt.
+
+Do not replace this constraint with Redis locks or a preflight query.
+
+PostgreSQL remains the source of truth for booking conflicts.
+
+### 4.2 Reservation State Machine
+
+Current states:
+
+- `held`: temporary reservation with an expiry timestamp.
+- `confirmed`: confirmed reservation.
+- `expired`: a hold whose expiry was observed.
+- `cancelled`: a confirmed booking that was cancelled.
+
+The current recurring endpoint bypasses the normal hold/confirmation/payment lifecycle and inserts confirmed rows directly.
+
+Target: define legal state transitions centrally and enforce them in the application service.
+
+Preserve historical rows. Do not delete expired or cancelled reservations to release a slot.
+
+### 4.3 Holds and Expiry
+
+The current hold TTL defaults to 300 seconds.
+
+Expiry is request-driven. There is no background worker.
+
+Target:
+
+- Use one documented clock policy for expiry and future-start checks.
+- Prefer database time for decisions that must be consistent across application instances.
+- A cleanup worker may perform storage hygiene and alerting.
+- Correctness must not depend on the worker running.
+- Confirmation must still reject expired holds.
+
+### 4.4 Member Booking Limit
+
+Current behavior counts future `held` and `confirmed` reservations toward a limit of three.
+
+Product owners must explicitly decide whether unconfirmed holds count.
+
+The current count-then-insert logic is not concurrency-safe.
+
+Target:
+
+1. Authenticate the member.
+2. Lock the member's booking-account row.
+3. Count eligible reservations.
+4. Validate the limit.
+5. Create the booking within the same transaction.
+
+All booking paths, including recurring creation and confirmation, must use the same enforcement function.
+
+Add concurrent tests proving the limit cannot be exceeded.
+
+## 5. Idempotency
+
+An idempotency key identifies a logical operation. It is not merely a string to put in a globally unique column.
+
+Target requirements:
+
+- Scope keys by authenticated member, operation and resource/request context.
+- Store a request fingerprint.
+- Store the final response or resource reference.
+- Same key and same logical request returns the original result.
+- Same key and different payload returns a conflict.
+- Enforce uniqueness in PostgreSQL.
+- Use stable provider idempotency keys for external operations.
+- Never return a payment belonging to another reservation.
+
+Fix the current confirmation defect where a globally unique key can cause reservation B to receive reservation A's payment.
+
+Fix hold replay behavior where a reused key with a different interval silently returns the original hold.
+
+Recurring requests must perform idempotency lookup before doing booking work.
+
+## 6. Payments and Refunds
+
+### 6.1 Current Behavior
+
+The provider adapter is a mock that returns synthetic references.
+
+Current charge/refund calls execute inside the database transaction.
+
+This is acceptable only as a mock demonstration. A real provider side effect cannot be rolled back by PostgreSQL.
+
+Recurring reservations currently have no payment record, so the normal cancellation path fails for them.
+
+### 6.2 Target Payment Workflow
+
+Do not call a real payment provider while holding a database transaction open.
+
+Use a persisted payment state machine and transactional outbox:
+
+1. In a database transaction, validate and lock the reservation.
+2. Create a payment intent or attempt.
+3. Create an outbox event.
+4. Commit the transaction.
+5. A worker claims the event.
+6. The worker calls the provider outside the database transaction.
+7. Use a stable provider idempotency key.
+8. Persist the provider result in a new transaction.
+9. Verify provider webhooks and apply them idempotently.
+10. Reconcile unknown outcomes by querying the provider.
+11. Use compensating actions for inconsistent outcomes.
+
+Refunds follow the same pattern.
+
+Store refund attempts and provider references. Cancellation records should distinguish:
+
+- requested
+- pending
+- succeeded
+- failed
+- unknown
+
+Do not represent every refund request as immediately completed.
+
+### 6.3 Recurring Billing Decision
+
+Before implementing recurring payments, decide whether a series is:
+
+- Paid in full before any occurrence is confirmed.
+- Charged per occurrence.
+
+The current behavior of creating confirmed reservations with no payments is not an acceptable production policy.
+
+Define recurring cancellation and partial-series cancellation semantics explicitly.
+
+## 7. Pricing and Time Zones
+
+Current pricing is a sample rule: INR 500 or INR 800 based on the supplied datetime's hour.
+
+It does not convert to the venue timezone, does not implement the earlier-described 17:00–21:00 interval, and mishandles intervals crossing the peak boundary.
+
+Target:
+
+- Store booking instants as aware `timestamptz` values.
+- Load the venue's IANA timezone.
+- Evaluate pricing windows in venue-local time.
+- Define peak windows with explicit start and end.
+- Handle cross-midnight windows if required.
+- Detect interval overlap with the pricing window.
+- Version pricing rules.
+- Persist the applied rule/version and final amount.
+- Define currency, taxes, fees, rounding and price locking.
+
+The exact peak schedule, holiday rules and price-locking policy are product decisions.
+
+Do not invent them in code.
+
+## 8. Availability and Utilization
+
+Availability is a snapshot, not a reservation.
+
+Keep the GET endpoint read-only. It should not mutate reservation states.
+
+Expired holds must not be treated as valid availability blockers.
+
+The hold command remains authoritative, and the exclusion constraint handles the final race.
+
+Current utilization reports confirmed booked hours over a supplied seven-day window.
+
+It is not a percentage because opening hours and capacity are not modeled.
+
+Decide whether inactive courts should appear and whether the report uses venue-local calendar weeks.
+
+If percentage utilization is required, model court opening hours and closures.
+
+## 9. Authentication and Authorization
+
+The current API trusts `member_id` supplied in request bodies and query parameters.
+
+The staff utilization route has no authorization.
+
+Target:
+
+- Integrate an OIDC identity provider.
+- Validate JWT signature, issuer, audience, expiry and permitted algorithms.
+- Map the verified subject to an internal member record.
+- Derive member identity from the authenticated principal.
+- Do not accept caller-selected member IDs for ownership-sensitive operations.
+- Enforce ownership checks in service-level authorization rules.
+- Add explicit staff roles and permissions.
+- Deny access by default.
+
+Test cross-member access, privilege escalation, expired tokens and invalid tokens.
+
+The identity provider and staff permissions remain product/security decisions.
+
+## 10. API Contract and Error Model
+
+Current endpoints:
+
+| Method | Path | Purpose |
 |---|---|---|
-| `venues` | `id` (uuid), `name` (≤120), `timezone` (≤64, default `UTC`) | Timezone is stored but no calculation reads it. |
-| `courts` | `id`, `venue_id` (FK, RESTRICT), `name` (≤120), `active` | Hold and availability endpoints reject inactive courts. The recurring endpoint does not check `active`. |
-| `reservations` | `id`, `court_id` (FK, RESTRICT), `member_id` (indexed), `starts_at`, `ends_at` (timestamptz), `status`, `hold_expires_at`, `price` NUMERIC(10,2), `currency` (3 characters, default `INR`), `idempotency_key` (unique, nullable), `created_at` | CHECK `ends_at > starts_at`. CHECK status in `held`, `confirmed`, `cancelled`, `expired`. EXCLUDE USING gist `(court_id WITH =, tstzrange(starts_at, ends_at, '[)') WITH &&) WHERE status IN ('held','confirmed')`. |
-| `payments` | `id`, `reservation_id` (FK, unique), `member_id`, `amount`, `currency`, `status`, `provider_reference` (unique, nullable), `idempotency_key` (unique, not null) | One payment per reservation by intent. Status is written as `succeeded`; the model default `pending` is never used. |
-| `payment_cancellations` | `id`, `payment_id` (FK), `idempotency_key` (unique), `refund_amount`, `status`, `reason`, `created_at` | One record per processed cancellation, including zero-refund cancellations. |
+| GET | `/health` | Health response |
+| POST | `/holds` | Create temporary hold |
+| POST | `/holds/{id}/confirm` | Confirm hold |
+| POST | `/bookings/{id}/cancel` | Cancel booking |
+| GET | `/courts/{id}/availability` | Availability snapshot |
+| POST | `/recurring/weekly` | Create weekly series |
+| GET | `/staff/utilization/weekly` | Staff utilization |
 
-The exclusion constraint is the core of the booking model. It is the only mechanism that prevents two active reservations from overlapping on the same court. Because it applies only to `held` and `confirmed` rows, moving a row to `cancelled` or `expired` releases the slot immediately. Rows are never deleted, which preserves history.
+Current errors use FastAPI's `{"detail": ...}` shape.
 
-### Reservation lifecycle
+Target a consistent problem response containing:
 
-A hold is created as `held` with `hold_expires_at` set to creation time plus `HOLD_TTL_SECONDS`. Confirmation moves a `held` row to `confirmed` and clears the expiry. A `held` row whose expiry has passed becomes `expired` the next time any booking operation sweeps, which is request-driven and has no background worker in this repository. A `confirmed` booking becomes `cancelled` through the cancel endpoint. `cancelled` and `expired` are terminal.
+- Stable error code
+- Human-readable detail
+- Optional field errors
+- Request/correlation ID
 
-Recurring series rows skip this lifecycle. They are inserted directly as `confirmed` with no `hold_expires_at` and no payment record (see defect D3).
+Validation errors, not-found, conflict and unexpected internal errors must remain distinguishable.
 
-## 4. Booking rules
+Never map every SQLAlchemy `IntegrityError` to "slot unavailable".
 
-### Time and intervals
+Inspect the violated constraint or SQLSTATE and map only the exclusion-constraint violation to a booking conflict.
 
-All booking intervals are timezone-aware instants stored as `timestamptz`. Intervals are half-open, `[starts_at, ends_at)`, so 10:00–11:00 and 11:00–12:00 do not overlap. Naive datetimes are rejected: with a 400 from the service for holds, and with a 422 from request validation for availability and the recurring and utilization endpoints.
+Do not expose raw database details to clients.
 
-### Holds
+## 11. Transactions and Persistence
 
-A hold lasts `HOLD_TTL_SECONDS`, which defaults to 300 seconds. The start time must be in the future and the end must be after the start, both checked against the application clock. Only `POST /holds` enforces the future-start rule; the recurring endpoint does not (defect D4).
+Keep transaction ownership explicit at the application-service use-case boundary.
 
-Each hold stores its price at creation time. Confirming later does not reprice it.
+A single use case should commit all its database state changes atomically.
 
-### Member limit
+Avoid hidden commits inside repositories.
 
-A member may have at most three reservations whose status is `held` or `confirmed` and whose start is after now. Unconfirmed holds count toward this limit. The earlier design document said they did not; the code does count them (reproduced: a fourth hold was rejected with 409 while three unconfirmed holds existed). The product decision is recorded in section 13, and the code is the current behavior.
+The current service may use savepoints when a session is already in a transaction.
 
-The limit is checked by counting rows and then inserting, without a row lock. Two concurrent requests from the same member can both pass the check (see section 5).
+A savepoint is not an independent commit.
 
-### Pricing
+Use database constraints for invariants that must survive concurrency:
 
-`BookingService.price_for` charges INR 800 if the start hour is 17 or later, or if the end hour is later than 17. Otherwise it charges INR 500. The hour is read from the datetime exactly as the client sent it, so the offset the client supplied determines the result. The source comment says UTC, but the code does not convert to UTC.
+- Interval validity
+- Active-slot exclusion
+- Foreign keys
+- Uniqueness
+- Valid states
 
-Verified by calling the function directly: 10:00–11:00 IST costs 500; 17:00–18:00 IST costs 800; 22:00–23:00 IST costs 800, because the peak rule has no end time; 16:30–17:30 IST costs 500, even though it overlaps 17:00; 17:00–18:00 UTC (22:30 IST) costs 800.
+Application validation improves error messages but does not replace database enforcement.
 
-The earlier design document described peak as 17:00–21:00. That is not what the code does. Venue timezone is not used. The pricing rule is a sample policy and is expected to be replaced (section 13).
+## 12. Schema Migrations
 
-### Confirmation
+Current startup runs `CREATE EXTENSION IF NOT EXISTS btree_gist` and `Base.metadata.create_all`.
 
-`confirm` locks the reservation row, checks that the member matches and that the hold has not expired (against the application clock), sets the row to `confirmed`, and creates a payment for the reservation's stored price with status `succeeded`. The payment's idempotency key is `confirm:` followed by the caller's key. A retry with the same key on the same reservation returns the existing payment. The intended guarantee is per reservation, but the uniqueness check is global, which causes defect D2.
+The initial Alembic revision also delegates to current metadata and its downgrade drops all tables.
 
-### Cancellation
+Target:
 
-Only `confirmed` bookings can be cancelled. A cancellation at least 24 hours before start refunds the full stored price. A cancellation within 24 hours refunds zero. Both cases create a `payment_cancellations` row, and the reservation moves to `cancelled`, which releases the slot. The refund calls the provider adapter with the key `cancel:` followed by the caller's key.
+- Stop creating application tables at service startup.
+- Use explicit, ordered Alembic revisions containing DDL.
+- Make extension creation and required privileges an explicit migration concern.
+- Test fresh database installation.
+- Test upgrades from the previous schema.
+- Run migrations as a deployment step.
+- Use a controlled database role for migrations.
+- Keep schema-owner privileges away from the runtime application role.
+- Make destructive downgrades explicit and safe.
 
-If the booking is already cancelled, the endpoint returns the refund recorded under the same key. A request with a different key returns zero, even if the original cancellation refunded the full amount (defect D16).
+## 13. Redis and Background Workers
 
-### Recurring weekly series
+Redis is currently configured but unused.
 
-`POST /recurring/weekly` creates one confirmed booking for each of N weeks, spaced seven days apart. All rows are inserted in one transaction, so any conflict rolls back the whole series with a 409. The member-limit check counts the requested number of weeks against existing future bookings. Because the limit is three, a series can never exceed three weeks in practice, although validation accepts 1 to 52.
+Do not add Redis to the booking correctness path.
 
-Recurring bookings do not pass through the payment service. This makes them uncancellable through the cancel endpoint (defect D3).
+Introduce Redis only for measured use cases such as:
 
-### Availability
+- Short-lived read caching.
+- Rate limiting.
 
-`GET /courts/{id}/availability` expires elapsed holds, then reports whether any `held` or `confirmed` row overlaps the requested interval. It returns 404 for missing or inactive courts. The answer is a snapshot. The hold endpoint is the authoritative attempt to reserve. The endpoint writes to the database because it runs the expiry sweep (defect D13).
+Every cache needs a TTL, invalidation strategy, bounded memory and safe PostgreSQL fallback.
 
-### Utilization
+Cache data must never override the exclusion constraint.
 
-`GET /staff/utilization/weekly` returns, for each court (optionally filtered to one venue), the sum of hours of `confirmed` reservations that overlap a seven-day window starting at `week_start`. It excludes `held` rows. "Utilization" here means booked hours, not a percentage, because the model has no opening hours and therefore no capacity figure. The window is computed from the supplied `week_start` and is not aligned to venue-local time. The report includes inactive courts (reproduced).
+Use a worker for:
 
-## 5. Correctness guarantees
+- Outbox delivery.
+- Payment reconciliation.
+- Optional hold cleanup.
 
-| Guarantee | Mechanism | Status |
+For the current scale, a database-backed outbox with PostgreSQL polling is sufficient.
+
+Add a message broker only when throughput, fan-out or operational needs justify it.
+
+## 14. Testing Strategy
+
+Current tests cover only a small subset of behavior.
+
+The database fixture can delete all rows in its configured database.
+
+Target test layers:
+
+- Unit tests for pricing, interval policies, state transitions and idempotency fingerprints.
+- Service tests using a dedicated disposable PostgreSQL database.
+- HTTP/API tests for every route.
+- Authentication and authorization tests.
+- Database integration tests for exclusion constraints, foreign keys, uniqueness and transaction rollback.
+- Migration upgrade tests.
+- Concurrency tests using separate database connections.
+- Payment adapter tests for success, failure, timeout and unknown outcomes.
+- Webhook duplicate-delivery tests.
+- Worker retry and lease-expiry tests.
+
+The test fixture must fail closed unless the database is explicitly identified as disposable.
+
+Never run teardown-wide deletes against a developer or production database.
+
+Prefer transaction rollback where compatible. Use a dedicated ephemeral database for tests that must commit or exercise concurrency.
+
+## 15. Deployment and Operations
+
+Before production:
+
+- Remove hard-coded credentials.
+- Use environment-injected secrets or a secret manager.
+- Add `.dockerignore`.
+- Ensure `.env`, VCS metadata, caches and virtual environments are not copied into images.
+- Run the API as a non-root user.
+- Add container health checks.
+- Separate liveness and readiness checks.
+- Document the Linux host-network requirement or move to a bridge network.
+- Add structured logs, metrics, traces, request IDs and error reporting.
+- Define backup retention.
+- Regularly test restore and PITR.
+- Add migration gates.
+- Add load tests and resource limits.
+- Define data retention, privacy, data residency and availability targets.
+
+## 16. Runtime and CI Configuration
+
+The supported runtime must be consistent across local development, Docker, CI and type checking.
+
+The README and Dockerfile specify Python 3.11, and the CI workflow has been changed to Python 3.11.
+
+The current `pyproject.toml` must also configure mypy for Python 3.11.
+
+The lockfile/runtime metadata must be regenerated or updated consistently rather than mixing interpreter targets.
+
+CI should run:
+
+1. Ruff lint.
+2. Ruff format check.
+3. Mypy.
+4. Pytest.
+
+Each check should run once against the documented PostgreSQL version.
+
+Keep the test database dedicated to CI.
+
+## 17. Known Defects and Planned Resolution
+
+| ID | Current defect | Target resolution |
 |---|---|---|
-| No overlapping active reservations on a court | PostgreSQL exclusion constraint with `btree_gist`. The database is the final authority; the availability check is only advisory. | Enforced. Covered by `test_database_rejects_overlapping_active_reservations`. The service converts any `IntegrityError` at flush into "Court slot is unavailable", so other integrity failures can be reported the same way. |
-| Confirm retries do not double charge | Unique payment key and a row lock on the reservation during confirmation. | Enforced for one reservation. Not enforced across reservations (D2). |
-| Multi-step database changes are atomic | Each service operation runs in one transaction, or in a savepoint when the caller already has one. Constraint errors roll back. | Enforced for database work. External provider calls happen inside the transaction and cannot be rolled back (D9). |
-| Holds are finite | Each hold stores an expiry timestamp. Confirmation rejects expired holds. | Enforced by the application clock. Not tested. A cleanup worker cannot extend a hold because no worker exists. |
-| Member limit of three | Count-then-insert with no lock. | **Not guaranteed** under concurrency (D8). |
+| D2 | Confirm idempotency can return another reservation's payment | Scope operation identity to member, operation and reservation; persist request fingerprint/result |
+| D3 | Recurring bookings have no payment record | Choose series billing policy and implement payment workflow |
+| D4 | Recurring accepts inactive courts and past starts | Move workflow into BookingService and apply shared validation |
+| D5 | Recurring key is not checked | Persist and return original series for identical retry |
+| D6 | Hold replay with changed interval silently returns original hold | Compare request fingerprint; return conflict for changed input |
+| D8 | Member limit races | Add member row and lock it during checking and booking writes |
+| D9 | Provider call occurs inside DB transaction | Outbox, worker, provider idempotency, webhooks and reconciliation |
+| D10 | Pricing uses caller offset and incomplete peak rule | Venue-local interval-overlap pricing with versioned rules |
+| D12 | Staff utilization is unauthenticated | Add staff authorization |
+| D13 | Availability GET mutates database | Make GET read-only and move cleanup to worker/write workflow |
+| D14 | Test fixture deletes all rows | Dedicated disposable test database and fail-closed URL guard |
+| D15 | Every IntegrityError maps to slot conflict | Inspect constraint/SQLSTATE and map only exclusion violations |
+| D16 | New-key repeat cancellation returns wrong refund | Return persisted cancellation outcome |
+| D17 | Caller supplies member identity | OIDC/JWT principal mapped to internal member |
 
-## 6. Time handling
+Additional gaps: route-level tests are absent, hold expiry is not tested, utilization includes inactive courts, and runtime configuration must remain consistent.
 
-Stored times are `timestamptz`. The application compares them with `datetime.now(UTC)`, which is the application server's clock. The database clock is not used for expiry or for the future-start check. If several application instances run with clock skew, a hold can expire earlier or later than its nominal five minutes by the size of the skew. Time comparisons assume the server clock is synchronized, for example with NTP.
+## 18. Decisions Required Before Implementation
 
-Pricing and the utilization window read the wall-clock values of the datetimes supplied by the client, so the offset in each request matters. Venue timezone is stored but unused.
+Do not silently choose business policy for these:
 
-## 7. API contract
+1. Do unconfirmed holds count toward the three-booking limit?
+2. Are recurring series paid upfront or per occurrence?
+3. What happens when one occurrence in a paid series is cancelled?
+4. What is the exact peak pricing window?
+5. Which venue-local timezone and holiday rules apply?
+6. Can staff override or cancel a member's booking?
+7. Should inactive courts appear in utilization reports?
+8. Is utilization booked hours or a percentage of opening capacity?
+9. Which OIDC provider and staff roles are required?
+10. Which payment provider, currencies, fees, taxes and refund rules apply?
+11. What are the expected request volume, retention, data residency and availability objectives?
 
-Errors use FastAPI's `{"detail": ...}` body. There are no machine-readable error codes. Money values are returned as decimal strings, for example `"500.00"`.
+## 19. Recommended Implementation Sequence
 
-| Method and path | Input | Success | Error responses |
-|---|---|---|---|
-| `POST /holds` | JSON: `court_id`, `member_id`, `starts_at`, `ends_at`, `idempotency_key` (8–200 characters) | 201 with the hold | 400 for naive, past, or inverted intervals; 404 for missing or inactive court; 409 for unavailable slot, member at limit, or key belonging to another member; 422 for schema violations |
-| `POST /holds/{id}/confirm` | JSON: `member_id`, `idempotency_key` | 200 with the payment | 404 when the hold is missing or belongs to another member; 409 when expired or not confirmable |
-| `POST /bookings/{id}/cancel` | JSON: `member_id`, `idempotency_key` | 200 with `booking_id`, `status`, `refund_amount`, `currency` | 404 when missing or wrong member; 409 when not confirmed; 500 "Payment record missing" for recurring bookings |
-| `GET /courts/{id}/availability` | Query: `starts_at`, `ends_at` (timezone-aware) | 200 with `available` | 404 for missing or inactive court; 422 for naive or inverted interval |
-| `POST /recurring/weekly` | Query: `court_id`, `member_id`, `starts_at`, `ends_at`, `weeks` (1–52). Header: `Idempotency-Key` (≥8 characters) | 200 with `created` and `booking_ids` | 409 for limit or conflict; 404 for missing court; 422 for naive or inverted interval |
-| `GET /staff/utilization/weekly` | Query: `week_start` (timezone-aware), optional `venue_id` | 200 with a list of court rows | 422 for naive `week_start` |
-| `GET /health` | None | 200 `{"status": "ok"}` | None |
+1. **Safety baseline:** dedicated test database guard, tests for every route, align Python configuration and remove duplicate CI steps.
+2. **Booking correctness:** centralize recurring booking logic, fix D2–D6, D10, D13, D15 and D16, and add concurrency-safe member limits.
+3. **Identity and authorization:** members/identity mapping, OIDC/JWT, ownership and staff roles.
+4. **Schema lifecycle:** explicit Alembic migrations and removal of startup `create_all`.
+5. **Payment reliability:** billing policies, payment state machine, outbox worker, signed webhooks and reconciliation.
+6. **Operations:** secrets, non-root image, health checks, observability, backup/PITR and load tests.
 
-The idempotency key on recurring requests is stored, but it is only used to build per-row keys and is never looked up before the request runs (D5). A hold replay with the same key returns 201 for the original hold, not 200, because the route always uses 201.
+Keep the application a modular monolith through these phases.
 
-Authentication is absent. Member identity is supplied in request bodies or query strings, and the utilization endpoint requires no credentials at all.
-
-## 8. Payment boundary
-
-`PaymentProvider` is an adapter with two methods, `charge` and `refund`. The mock returns deterministic strings such as `mock-charge:<key>` and never fails. `PaymentService` creates payment rows, and `PaymentCancellation` creates cancellation records and applies the refund policy. The module docstring says a real provider can replace the mock without changing routes. That is true for routes, but not for transactions: `charge` and `refund` run inside the database transaction that holds the reservation's row lock. A real provider that succeeds followed by a database failure would leave money moved and the database rolled back. Section 13 covers the fix.
-
-## 9. Configuration
-
-Settings load from the environment and from `.env`, using pydantic-settings. The fields are `DATABASE_URL` (default points at localhost with the `courtbook` user), `HOLD_TTL_SECONDS` (default 300), `REDIS_ENABLED` and `REDIS_URL` (unused by code), and `APP_ENV` (unused by code). The `.env.example` file points at the hostnames `db` and `redis`, which resolve only inside a Compose bridge network. The Compose file uses host networking, so `127.0.0.1` is the correct host there.
-
-## 10. Schema management
-
-On every startup, the application runs `CREATE EXTENSION IF NOT EXISTS btree_gist` and `Base.metadata.create_all`. `create_all` creates missing tables but never alters existing ones. The Alembic revision `0001_initial` also calls `create_all` against the current models, so it does not reproduce a historical schema, and its downgrade drops every table. Before any deployed schema changes, the project must move to revisions that contain explicit DDL and must stop calling `create_all` at startup.
-
-## 11. Deployment and operations
-
-`docker compose up --build` starts PostgreSQL 15 and the API using host networking, which is intended for Linux Docker Engine. Ports 5432 and 8000 are bound on the host. The database password is hard-coded in `docker-compose.yml`. The API image runs as root, has no health check, and has no `.dockerignore`, so `.env` and `.git` would be copied into the image by `COPY . .`. The README says host networking also applies to the image build; the Compose file does not set `build.network`, so that claim should be verified before relying on it.
-
-Dependencies are declared in two places, requirements.txt and uv.lock, and pyproject.toml declares no dependencies. The Python version is inconsistent: the Dockerfile and README use 3.11, CI and mypy use 3.14, uv.lock requires 3.14, and five `.pyc` files for CPython 3.13 are tracked in git despite `.gitignore` excluding them.
-
-CI runs ruff lint, ruff format check, mypy, and pytest against PostgreSQL 15. The workflow lists the pytest step twice.
-
-## 12. Known defects
-
-The table below lists defects found in review. "Reproduced" means the behavior was observed through the API. "By reading" means it follows from the code.
-
-| ID | Area | Behavior | Evidence | Severity |
-|---|---|---|---|---|
-| D2 | Confirm | Reusing one confirm key on two reservations returns the first reservation's payment for the second. The second reservation becomes `confirmed` with no payment of its own. | Reproduced: second confirm returned the first reservation's `reservation_id`. | High |
-| D3 | Recurring | Recurring bookings have no payment record. Cancelling one returns 500 "Payment record missing". | Reproduced. | High |
-| D4 | Recurring | Recurring requests accept inactive courts and start times in the past. | Reproduced: both returned 200. | High |
-| D5 | Recurring | The `Idempotency-Key` header is never looked up. An identical retry returns 409, and the message "would exceed the 3-booking limit" is misleading. | Reproduced. | Medium |
-| D6 | Holds | Replaying a hold with the same key but a different time returns the original hold with 201. The caller is not told the new request was ignored. | Reproduced: returned the original start time. | Medium |
-| D8 | Member limit | Concurrent requests from one member can exceed three active bookings. | By reading; acknowledged in LIMITATIONS.md. | Medium |
-| D9 | Payments | Provider calls run inside the database transaction and cannot be rolled back. | By reading; acknowledged in LIMITATIONS.md. | High once a real provider is used |
-| D10 | Pricing | Peak pricing has no 21:00 end, uses the client's offset, and treats 16:30–17:30 as off-peak. The earlier document described a different rule. | Reproduced by calling `price_for` directly. | Medium |
-| D12 | Utilization | The staff endpoint needs no credentials and includes inactive courts. | Reproduced. | High for exposure |
-| D13 | Availability | A GET request writes to the database to expire holds. | By reading. | Low |
-| D14 | Tests | The `db_session` fixture deletes every row in every table during teardown. Running the tests against a non-disposable database would erase its data. | By reading. | High operational risk |
-| D15 | Integrity errors | Any `IntegrityError` during hold creation, including a duplicate idempotency key, is reported as "Court slot is unavailable". | By reading. | Low |
-| D16 | Cancellation | Cancelling an already-cancelled booking with a new key returns a zero refund, even if the original cancellation refunded the full amount. | By reading. | Low |
-| D17 | Security | Member identity comes from the caller. Any client can act as any member. | By reading; acknowledged in LIMITATIONS.md. | High before exposure |
-
-Test coverage is thin. The `test_contract.py` file contains one pricing unit test, not a contract test. Three database tests cover the exclusion constraint, the confirm retry, and rollback on failure. No test exercises the HTTP routes, although httpx is a dependency, and nothing covers cancellation, recurring series, availability, utilization, or hold expiry.
-
-## 13. Open questions and decisions
-
-Several defects depend on product decisions. Should unconfirmed holds count toward the three-booking limit? The code says yes; the earlier document said no. Should recurring series be paid up front, charged per occurrence, or free? Who is responsible for the three-booking limit when a series is created? What is the peak schedule, does it have an end time, and does it belong to each venue? Should pricing use venue-local time, and can staff change prices over time? Should inactive courts accept recurring bookings? What counts as utilization: booked hours or a percentage of opening hours, and where are opening hours stored? Which identity provider and roles apply, and who may cancel or override a booking? Which payment provider, currencies, tax rules, fees, and refund settlement apply? What are expected request volume, retention, data residency, and availability targets?
-
-## 14. Alternatives considered
-
-Redis locks as the booking authority were rejected because lock expiry, network partitions, and failover can break correctness. Redis may later accelerate reads, but PostgreSQL constraints remain the authority.
-
-A preflight availability check followed by an insert was rejected because two concurrent requests can both see an empty slot. The exclusion constraint closes that race.
-
-Deleting expired holds immediately was rejected because it loses history. Holds move to `expired` and are kept.
-
-Putting booking logic in one route handler was rejected in favor of services and a payment adapter. The recurring endpoint currently departs from this and should be moved into the service layer.
-
-A distributed transaction across PostgreSQL and a payment provider is generally not available. A real integration needs provider idempotency keys, an outbox, reconciliation for unknown outcomes, and compensating actions when the provider and database disagree.
-
-## 15. Recommended order of work
-
-Fix D2, D3, and D4 first, because they break money and booking rules in normal use. Then fix D5 and D6 so retries behave predictably, and move recurring logic into `BookingService`. Protect the staff endpoint and move member identity onto verified authentication (D12, D17). Make the test fixture use a disposable database and add HTTP tests for each route (D14). Before a real provider is connected, move provider calls outside the database transaction with an outbox and reconciliation (D9). Resolve the concurrency gap on the member limit with a row lock on the member or a counter table (D8). Replace `create_all` with Alembic revisions that contain explicit DDL (section 10).
+Split components into separate services only when independent scaling, ownership or deployment needs are demonstrated.
