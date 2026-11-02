@@ -1,3 +1,4 @@
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
@@ -21,7 +22,7 @@ from app.services.bookings import BookingError, BookingService
 
 
 @asynccontextmanager
-async def lifespan(_: FastAPI):
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     with engine.begin() as connection:
         connection.execute(text("CREATE EXTENSION IF NOT EXISTS btree_gist"))
     Base.metadata.create_all(bind=engine)

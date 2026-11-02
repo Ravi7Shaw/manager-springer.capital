@@ -6,7 +6,7 @@ from app.db import SessionLocal
 from app.models import Court, Venue
 
 
-def create_court(venue_name: str, court_name: str, timezone: str):
+def create_court(venue_name: str, court_name: str, timezone: str) -> dict[str, str | object]:
     with SessionLocal.begin() as session:
         venue = session.scalar(select(Venue).where(Venue.name == venue_name).limit(1))
 
@@ -50,7 +50,7 @@ def create_court(venue_name: str, court_name: str, timezone: str):
     return result
 
 
-def view_courts():
+def view_courts() -> None:
     with SessionLocal() as session:
         statement = (
             select(Venue, Court)
@@ -78,7 +78,7 @@ def view_courts():
             print("-" * 100)
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="CourtBook development management CLI")
 
     parser.add_argument("--venue", default="Central Venue")
